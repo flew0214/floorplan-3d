@@ -1,0 +1,140 @@
+# 本地部署说明（GreenMountainTeam / floorplan-3d）
+
+本目录源自 [wy51ai/floorplan-3d](https://github.com/wy51ai/floorplan-3d)（MIT，原作者 wuyi），
+是 `GreenMountainTeam` 项目组下的第三个独立子项目（与 `layout-designer`、`room-designer` 并列），
+现维护在 [flew0214/floorplan-3d](https://github.com/flew0214/floorplan-3d)。
+
+上游是**零构建**应用：整个应用就是一个 `index.html`，原生 HTML/CSS/JS + Three.js r160，
+双击即可用，不需要 npm install、不需要打包。
+
+---
+
+## 运行
+
+```bash
+cd floorplan-3d
+
+# 方式一：直接用浏览器打开 index.html
+#   注意：file:// 协议下 importmap 指向的本地模块能加载，但个别浏览器对
+#         file:// 的 ES module 有限制，推荐用方式二。
+
+# 方式二：起一个本地静态服务器（推荐）
+python -m http.server 8123
+# 打开 http://localhost:8123
+```
+
+无需 `npm install`。所有第三方依赖已经 vendor 到本地（见下）。
+
+---
+
+## 本地化改动（相对上游的唯一差异）
+
+上游 `index.html` 通过 jsDelivr CDN 加载 Three.js：
+
+```html
+"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+"three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+```
+
+国内访问 jsDelivr 不稳定，且**首次打开 3D 场景需要联网**。本地改动为：
+
+```html
+"three":"./vendor/three/three.module.js",
+"three/addons/":"./vendor/three/addons/"
+```
+
+### vendor 目录内容
+
+来源：`npm pack three@0.160.0`（精确版本，非 CDN 实时内容）。
+
+```
+vendor/three/
+├── three.module.js          # three r160 主模块（自包含，无嵌套 import）
+├── LICENSE                  # three 的 MIT 许可证（再分发必须保留）
+└── addons/
+    ├── controls/OrbitControls.js
+    ├── controls/PointerLockControls.js
+    ├── geometries/RoundedBoxGeometry.js
+    ├── environments/RoomEnvironment.js
+    └── renderers/CSS2DRenderer.js
+```
+
+这 5 个 addon 只依赖 `three` 本体，彼此无嵌套依赖，因此**只 vendor 这 6 个文件即可**，
+无需引入整个 three 包（完整包解压后体积是这里的几十倍）。
+
+> 目录刻意**不使用 `build/` 这一层**：上游 `.gitignore` 里有 `build/`，会把
+> `vendor/three/build/` 整体忽略掉，导致依赖文件无法入库。
+
+---
+
+## Git 远程与上游更新
+
+remote 按 fork 惯例配置：
+
+| remote | 地址 | 用途 |
+| --- | --- | --- |
+| `origin` | `flew0214/floorplan-3d` | 本项目自己的仓库，推送目标 |
+| `upstream` | `wy51ai/floorplan-3d` | 原作者仓库，用于跟进上游更新 |
+
+拉取上游更新：
+
+```bash
+cd floorplan-3d
+git fetch upstream
+git log --oneline HEAD..upstream/master   # 看上游有什么新提交
+git merge upstream/master                 # 合并
+```
+
+**合并时唯一可能冲突的位置**就是上面那 2 行 importmap。如果上游又改了 CDN 地址，
+合并后按本文件「本地化改动」一节改回本地路径即可。
+
+vendor 目录不随上游更新，需要 three 升版本时手动重来一次：
+
+```bash
+npm pack three@<版本号> --pack-destination <临时目录>
+tar -xzf <临时目录>/three-<版本号>.tgz -C <临时目录>
+# 覆盖 vendor/three/three.module.js 与 vendor/three/addons/... 后同步改 index.html 的 importmap
+```
+
+---
+
+## 许可
+
+- 本项目源自 `wy51ai/floorplan-3d`：**MIT**，Copyright (c) 2026 wuyi
+  （本仓库为 fork，保留原作者版权声明与许可证全文）
+- Three.js r160：**MIT**，Copyright (c) 2010-2023 three.js authors
+
+两者均允许使用、修改、再分发与商用，条件是保留版权声明与许可证全文。
+`vendor/three/LICENSE` 已随依赖一起保留。**注意 MIT 许可与本项目组
+`room-designer` / `layout-designer` 所用的 AGPL-3.0 是两套独立协议**——
+本目录作为独立子项目不涉及 AGPL 代码的混合分发；若后续要把本项目代码
+合并进 AGPL 项目，需另行评估协议义务。
+
+---
+
+## 功能速览（来自上游 README）
+
+- **2D 平面**：按原始户型比例显示，单位 mm；60+ 种家具家电可拖入；移动/旋转/改尺寸；
+  贴墙自动吸附；测量工具；拆改非承重墙（承重墙单独标示）；图层开关
+- **3D 场景**：鸟瞰/斜视/俯视多种视角；第一人称漫游（桌面 WASD + 触屏虚拟摇杆，可开关门）；
+  全高墙/剖切墙切换；日照时间滑块；夜景灯光；精细家具模型（柜门分缝、软包床头、
+  金属陶瓷环境反射）；3D 中可直接选中拖动家具，与 2D 方案实时同步
+- **方案与统计**：房间面积与套内面积统计；按房间更换地面材料并按面积 +5% 损耗估算造价；
+  撤销/重做；方案自动存 localStorage；简中/繁中/EN 三语切换；导出 PNG、导出/导入方案 JSON
+
+### 快捷键
+
+| 按键 | 作用 |
+| --- | --- |
+| `T` | 切换 2D / 3D |
+| `V` / `M` / `X` | 选择 / 测量 / 拆改墙体 |
+| `R` / `Shift+R` | 选中家具顺/逆时针旋转 90° |
+| `Delete` / `Backspace` | 删除选中家具 |
+| `Ctrl/⌘ + D` | 复制选中家具 |
+| `Ctrl/⌘ + Z`，`Ctrl/⌘ + Shift + Z` | 撤销 / 重做 |
+| `F` | 适应窗口 |
+| `+` / `-` | 放大 / 缩小 |
+| `[` / `]` | 展开/收起左侧家具库、右侧面板 |
+| `Shift + F` | 全屏 |
+| `Esc` | 取消当前操作 |
+| 漫游 | `WASD` / 方向键移动，`Shift` 疾走，`E` 开关门 |
