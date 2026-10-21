@@ -5,43 +5,65 @@
 现维护在 [flew0214/floorplan-3d](https://github.com/flew0214/floorplan-3d)。
 
 上游是**零构建**应用：整个应用就是一个 `index.html`，原生 HTML/CSS/JS + Three.js r160，
-双击即可用，不需要 npm install、不需要打包。
+不需要 npm install、不需要打包。
 
 ---
 
 ## 运行
 
+**推荐双击 `启动.bat`（Windows）**，或用跨平台的 `start.py`：
+
 ```bash
 cd floorplan-3d
-
-# 方式一：直接用浏览器打开 index.html
-#   注意：file:// 协议下 importmap 指向的本地模块能加载，但个别浏览器对
-#         file:// 的 ES module 有限制，推荐用方式二。
-
-# 方式二：起一个本地静态服务器（推荐）
-python -m http.server 8123
-# 打开 http://localhost:8123
+python start.py          # 默认 8123 端口；端口被占用会自动往后找
+python start.py 9000     # 指定端口
 ```
+
+启动器会起一个本地静态服务器并自动打开浏览器。等价的其它方式：
+
+```bash
+python -m http.server 8123   # 然后自己打开 http://127.0.0.1:8123/index.html
+npx serve .                  # Node 环境
+```
+
+也可以直接双击 `index.html`（`file://`），此时 three.js 会回退到 CDN 加载——
+见下面「协议自适应 importmap」一节。
 
 无需 `npm install`。所有第三方依赖已经 vendor 到本地（见下）。
 
 ---
 
-## 本地化改动（相对上游的唯一差异）
+## 协议自适应 importmap（相对上游的主要差异）
 
-上游 `index.html` 通过 jsDelivr CDN 加载 Three.js：
+上游 `index.html` 用**静态** importmap，Three.js 固定走 jsDelivr CDN：
 
 ```html
 "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
 "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
 ```
 
-国内访问 jsDelivr 不稳定，且**首次打开 3D 场景需要联网**。本地改动为：
+国内访问 jsDelivr 不稳定，且首次打开 3D 场景必须联网。本地改为**动态**注入 importmap，
+按协议自动选择依赖来源：
 
-```html
-"three":"./vendor/three/three.module.js",
-"three/addons/":"./vendor/three/addons/"
+```js
+var LOCAL = {three:'./vendor/three/three.module.js', 'three/addons/':'./vendor/three/addons/'};
+var CDN   = {three:'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js',
+             'three/addons/':'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/'};
+// file:// → CDN，http(s):// → 本地 vendor
 ```
+
+**为什么 `file://` 必须用 CDN：** 浏览器把每个 `file:` 文档当作独立源（origin 为 `null`），
+会用 CORS 策略禁止 `file://` → `file://` 的 ES module 导入——**本地 vendor 文件也一样被拦**。
+上游的 CDN 能工作，是因为 jsDelivr 响应带 `Access-Control-Allow-Origin: *`，能匹配 `null` origin。
+
+> 实测（Chrome 126）：
+> | 打开方式 | 依赖来源 | `window.View3D` | 结果 |
+> | --- | --- | --- | --- |
+> | `file://` | CDN | `object` | 3D 正常（需联网） |
+> | `http://` | 本地 vendor | `object` | 3D 正常（完全离线，零外部请求） |
+>
+> 如果只把静态 importmap 指向本地 vendor，`file://` 下 6 个模块会被 CORS 全部拦截，
+> 点「3D 场景」只会弹提示、什么都不发生。
 
 ### vendor 目录内容
 
@@ -67,6 +89,20 @@ vendor/three/
 
 ---
 
+## 方案存储（容易踩的坑）
+
+方案存在 `localStorage` 的 `huxing-design-v1` 键里，而 **localStorage 按「协议 + 域名 + 端口」隔离**：
+
+- `file:///E:/.../index.html` 与 `http://127.0.0.1:8123/index.html` 是**两个不同的存储空间**
+- 同一个 `file://` 页面，Chrome 里所有 `file:` 文档还可能共享同一个存储空间
+
+所以「换了打开方式，家具就没了」是**换了个存储空间**，不是数据丢了。
+同理，在 `file://` 下点了「清空布置」，会一直保存为空方案，直到你点「文件 → 重置为默认方案」。
+
+界面内恢复默认：**文件 ▾ → 重置为默认方案**（可撤销）。
+
+---
+
 ## Git 远程与上游更新
 
 remote 按 fork 惯例配置：
@@ -85,15 +121,15 @@ git log --oneline HEAD..upstream/master   # 看上游有什么新提交
 git merge upstream/master                 # 合并
 ```
 
-**合并时唯一可能冲突的位置**就是上面那 2 行 importmap。如果上游又改了 CDN 地址，
-合并后按本文件「本地化改动」一节改回本地路径即可。
+**合并时唯一可能冲突的位置**就是上面那段 importmap 代码块（动态注入那段）。
+如果上游又改了 CDN 地址，合并后按本文件「协议自适应 importmap」一节确认两套地址都还在即可。
 
 vendor 目录不随上游更新，需要 three 升版本时手动重来一次：
 
 ```bash
 npm pack three@<版本号> --pack-destination <临时目录>
 tar -xzf <临时目录>/three-<版本号>.tgz -C <临时目录>
-# 覆盖 vendor/three/three.module.js 与 vendor/three/addons/... 后同步改 index.html 的 importmap
+# 覆盖 vendor/three/three.module.js 与 vendor/three/addons/... 后同步改 index.html 里 CDN 那份地址
 ```
 
 ---

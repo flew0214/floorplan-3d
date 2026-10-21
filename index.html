@@ -214,11 +214,24 @@ main.drawer-panel #fab{opacity:0;visibility:hidden}
   .brand span,footer .only2d{display:none!important}
 }
 </style>
-<script type="importmap">
-{"imports":{
-  "three":"./vendor/three/three.module.js",
-  "three/addons/":"./vendor/three/addons/"
-}}
+<script>
+/* ============================================================
+ *  importmap —— 必须早于下面的 <script type="module"> 就位。
+ *
+ *  浏览器在 file:// 下把每个 file: 文档当作独立源，会用 CORS 策略
+ *  禁止 file→file 的 ES module 导入（本地 three 也一样被拦），
+ *  所以 file:// 时回退到 CDN；http(s):// 下则用本地 vendor，
+ *  完全离线可用、加载也快。
+ * ============================================================ */
+(function(){
+  var LOCAL = {three:'./vendor/three/three.module.js', 'three/addons/':'./vendor/three/addons/'};
+  var CDN   = {three:'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js',
+               'three/addons/':'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/'};
+  var s = document.createElement('script');
+  s.type = 'importmap';
+  s.textContent = JSON.stringify({imports: location.protocol === 'file:' ? CDN : LOCAL});
+  document.head.appendChild(s);
+})();
 </script>
 </head>
 <body>
@@ -1419,7 +1432,9 @@ const TIPS = () => COARSE
      '3d':tr('3D 场景与平面方案实时同步 · 右侧面板修改会立即生效 · T 返回 2D', '3D stays in sync with the plan · panel edits apply instantly · T for 2D')};
 async function setView(m){
   if (m === viewMode || switching) return;
-  if (!window.View3D) return toast(tr('3D 引擎仍在加载或加载失败（需要联网加载 three.js）', '3D engine is still loading or failed to load (three.js needs a network connection)'));
+  if (!window.View3D) return toast(location.protocol === 'file:'
+    ? tr('浏览器在 file:// 下会拦截 ES 模块，3D 无法加载。请双击「启动.bat」打开（会自动起本地服务器）', 'Browsers block ES modules under file:// so 3D cannot load. Run 启动.bat / start.py instead (starts a local server)')
+    : tr('3D 引擎仍在加载或加载失败', '3D engine is still loading or failed to load'));
   switching = true; document.body.classList.add('busy');
   viewMode = m;
   if (m === '3d'){ if (ui.tool !== 'select') setTool('select'); ui.mA = null; document.body.classList.add('m3d'); await window.View3D.enter(); }
