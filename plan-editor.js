@@ -22,6 +22,10 @@ let pdrag      = null;    // 拖拽过程
 let roomSeq    = 0;       // 新房间序号
 let followRoom = true;    // 房间尺寸变化时，贴合的墙体跟着走
 let paletteKey = '';      // 左侧调色板缓存键，避免每次改动都重建 DOM
+let planSeg    = 'edit';  // 户型编辑器的两段：edit = 改房间，gen = 生成户型
+let genArea    = 90;      // 生成器：套内使用面积 m²
+let genRatio   = 1;       // 生成器：外形长宽比（1 = 正方形）
+let genTpl     = '3r';    // 生成器：户型模板
 
 /* -------------------------------------------------------------- 小工具 */
 const el = s => document.querySelector(s);
@@ -404,6 +408,9 @@ function planOverviewHtml(){
       <td class="r">${fmt(area(r.poly))} m²</td></tr>`;
   }).join('');
   return `
+  ${planSeg === 'gen' ? `<section><h3>${tr('当前户型（将被覆盖）','Current plan (will be replaced)')}</h3>
+    <div class="muted" style="font-size:12px">${tr('在左侧选好面积、形状和户型模板后点「生成户型」，当前户型会被整体替换（可用「撤销」回退）。',
+      'Pick area, shape and layout on the left, then press Generate. The current plan is replaced (Undo restores it).')}</div></section>` : ''}
   <section><h3>${tr('户型总览','Floor Plan')} <small>${tr('点击房间可选中编辑','Click a room to edit')}</small></h3>
     <table>${rows || `<tr><td class="muted">${tr('暂无房间','No rooms')}</td></tr>`}</table>
     <div class="stats" style="margin-top:8px">
@@ -647,8 +654,252 @@ function resetPlan(){
 }
 
 /* =======================================================================
+ *  户型生成器（第二段）：按「面积 + 形状」生成一整套默认户型
+ *
+ *  做法：把矩形按「功能分带」切成若干横条，每条再按面积配额竖着切成房间，
+ *  然后由房间边界反推墙体、窗与门 —— 这样房间和墙天然对得上，不会出现
+ *  「房间改了、墙没跟上」的两套数据不一致。
+ *
+ *  模板里的每个 band 是一条横带，band 内从左到右排房间；相邻房间天然相邻，
+ *  相邻 band 的房间天然上下相邻，房间门因此总能落在真实存在的墙上。
+ * ==================================================================== */
+const GEN_TEMPLATES = {
+  '1r': {zh:'一室一厅一卫', en:'1 bed / 1 living / 1 bath', items:[
+    ['客厅',.32],['餐厅',.11],['厨房',.10],['主卧',.28],['卫生间',.09],['玄关',.10]]},
+  '2r': {zh:'两室两厅一卫', en:'2 bed / 2 living / 1 bath', items:[
+    ['客厅',.26],['餐厅',.11],['厨房',.09],['主卧',.22],['次卧',.15],['卫生间',.08],['玄关',.09]]},
+  '3r': {zh:'三室两厅两卫', en:'3 bed / 2 living / 2 bath', items:[
+    ['客厅',.22],['餐厅',.10],['厨房',.08],['主卧',.17],['次卧',.12],['次卧',.12],['卫生间',.05],['卫生间',.05],['玄关',.09]]},
+  '4r': {zh:'四室两厅两卫', en:'4 bed / 2 living / 2 bath', items:[
+    ['客厅',.19],['餐厅',.09],['厨房',.07],['主卧',.16],['次卧',.11],['次卧',.11],['次卧',.11],['卫生间',.05],['卫生间',.05],['玄关',.06]]},
+};
+const GEN_RATIOS = [['square',1,'正方形','Square'],['r43',4/3,'长方形 4:3','Rectangle 4:3'],
+                    ['r32',3/2,'长方形 3:2','Rectangle 3:2'],['r169',16/9,'长方形 16:9','Rectangle 16:9'],
+                    ['r21',2,'长方形 2:1','Rectangle 2:1']];
+const GEN_MATS = {主卧:'wood', 次卧:'wood', 客厅:'tile800', 餐厅:'tile800', 厨房:'tile600',
+                  卫生间:'antislip', 玄关:'tile600'};
+
+// 把矩形按面积配额递归二分（treemap 切片），得到长宽比较合理的房间矩形，
+// 同时记录所有切分位置（= 内墙位置）
+function genSlice(inner, items, T){
+  const HALF = T/2, rooms = [], cuts = [];
+  const rec = (r, list) => {
+    if (!list.length) return;
+    if (list.length === 1){ rooms.push({name:list[0][0], rect:r}); return; }
+    const total = list.reduce((a,i)=>a+i[1], 0);
+    let best = 1, bd = Infinity;
+    for (let k = 1; k < list.length; k++){
+      const a = list.slice(0,k).reduce((s,i)=>s+i[1],0)/total;
+      if (Math.abs(a-.5) < bd){ bd = Math.abs(a-.5); best = k; }
+    }
+    const g1 = list.slice(0,best), g2 = list.slice(best);
+    const q1 = g1.reduce((a,i)=>a+i[1],0), q2 = g2.reduce((a,i)=>a+i[1],0);
+    const w = r.x1-r.x0, h = r.y1-r.y0;
+    if (w >= h){                                   // 宽大于高 → 竖着切
+      const cut = r.x0 + w*q1/(q1+q2);
+      cuts.push({vert:true, pos:cut, a:r.y0, b:r.y1});
+      rec({x0:r.x0, y0:r.y0, x1:cut-HALF, y1:r.y1}, g1);
+      rec({x0:cut+HALF, y0:r.y0, x1:r.x1, y1:r.y1}, g2);
+    } else {                                      // 高大于宽 → 横着切
+      const cut = r.y0 + h*q1/(q1+q2);
+      cuts.push({vert:false, pos:cut, a:r.x0, b:r.x1});
+      rec({x0:r.x0, y0:r.y0, x1:r.x1, y1:cut-HALF}, g1);
+      rec({x0:r.x0, y0:cut+HALF, x1:r.x1, y1:r.y1}, g2);
+    }
+  };
+  rec(inner, items);
+  return {rooms, cuts};
+}
+
+// 由房间矩形反推墙 / 窗 / 门，组装成一份完整的 plan
+function assemblePlan(lay, inner, T){
+  const HALF = T/2;
+  const walls = [], wins = [], doors = [];
+  // 外墙：套内矩形外扩一圈
+  const IW = inner.x1-inner.x0, IH = inner.y1-inner.y0;
+  walls.push([-T,-T, 0, IH+T,'e']);                       // 左
+  walls.push([-T,-T, IW+T, 0,'e']);                      // 上
+  walls.push([IW,-T, IW+T, IH+T,'e']);                   // 右
+  walls.push([-T, IH, IW+T, IH+T,'e']);                  // 下
+  // 内墙：每条切分线都是一道墙
+  lay.cuts.forEach(c => {
+    walls.push(c.vert ? [c.pos-HALF, c.a, c.pos+HALF, c.b, 'n'] : [c.a, c.pos-HALF, c.b, c.pos+HALF, 'n']);
+  });
+  // 房间
+  const used = {};
+  const rooms = lay.rooms.map((r, i) => {
+    const base = r.name;
+    used[base] = (used[base]||0) + 1;
+    const n = used[base];
+    const name = n > 1 ? base + ' ' + n : base;
+    const mat = GEN_MATS[base] || 'tile800';
+    const b = r.rect;
+    return {id:'g'+i, name, mat, at:[(b.x0+b.x1)/2, (b.y0+b.y1)/2],
+            poly:[[b.x0,b.y0],[b.x1,b.y0],[b.x1,b.y1],[b.x0,b.y1]]};
+  });
+  // 窗：贴着外墙的房间在外墙带上开窗
+  const winLen = {主卧:1500, 次卧:1500, 客厅:2400, 餐厅:1500, 厨房:1200, 卫生间:600};
+  rooms.forEach((r, i) => {
+    const b = lay.rooms[i].rect, base = r.name.replace(/ \d+$/,'');
+    if (base === '玄关') return;
+    const L = winLen[base] || 1200, sill = base === '卫生间' ? 1.4 : .9;
+    const put = (horiz, pos, a, bnd) => {
+      const span = bnd - a, len = Math.min(L, Math.max(400, span - 400));
+      const mid = (a+bnd)/2, s = mid-len/2, e = mid+len/2;
+      wins.push(horiz ? [s, pos, e, pos+T, sill] : [pos, s, pos+T, e, sill]);
+    };
+    if (Math.abs(b.x0-inner.x0) < 1) put(false, inner.x0-T, b.y0, b.y1);
+    if (Math.abs(b.x1-inner.x1) < 1) put(false, inner.x1, b.y0, b.y1);
+    if (Math.abs(b.y0-inner.y0) < 1) put(true, inner.y0-T, b.x0, b.x1);
+    if (Math.abs(b.y1-inner.y1) < 1) put(true, inner.y1, b.x0, b.x1);
+  });
+  // 内部门：相邻房间之间开门
+  // 规则：卫生间之间、卧室之间、卧室↔卫生间、厨房↔卫生间/卧室都不开门；
+  // 每个房间最多保留 2 扇内门；最后做连通性修复，保证每个房间都有门。
+  const isBed = n => n === '主卧' || n === '次卧';
+  const base = n => n.replace(/ \d+$/,'');
+  const doorOK = (a, b) => {
+    const ba = base(a), bb = base(b);
+    if (ba === '卫生间' && bb === '卫生间') return false;
+    if (isBed(ba) && isBed(bb)) return false;
+    if (isBed(ba) && bb === '卫生间') return false;
+    if (isBed(bb) && ba === '卫生间') return false;
+    if (ba === '厨房' && (bb === '卫生间' || isBed(bb))) return false;
+    if (bb === '厨房' && (ba === '卫生间' || isBed(ba))) return false;
+    return true;
+  };
+  // 一对相邻房间之间的门位（几何上共用一道 240 的墙）
+  const doorGeom = (i, j) => {
+    const A = lay.rooms[i].rect, B = lay.rooms[j].rect;
+    const vA = Math.abs(A.x1+T-B.x0) < 2, vB = Math.abs(B.x1+T-A.x0) < 2;
+    const hA = Math.abs(A.y1+T-B.y0) < 2, hB = Math.abs(B.y1+T-A.y0) < 2;
+    if (vA || vB){
+      const left = vA ? A : B;
+      const lo = Math.max(left.y0, (vA?B:A).y0), hi = Math.min(left.y1, (vA?B:A).y1);
+      if (hi-lo <= 900) return null;
+      const mid = (lo+hi)/2, h = Math.min(400, (hi-lo)/2-200);
+      return {rect:[left.x1, mid-h, left.x1+T, mid+h], o:[-1,0]};
+    }
+    if (hA || hB){
+      const top = hA ? A : B;
+      const lo = Math.max(top.x0, (hA?B:A).x0), hi = Math.min(top.x1, (hA?B:A).x1);
+      if (hi-lo <= 900) return null;
+      const mid = (lo+hi)/2, h = Math.min(400, (hi-lo)/2-200);
+      return {rect:[mid-h, top.y1, mid+h, top.y1+T], o:[0,-1]};
+    }
+    return null;
+  };
+  const cands = [];
+  for (let i = 0; i < rooms.length; i++){
+    for (let j = i+1; j < rooms.length; j++){
+      if (!doorOK(rooms[i].name, rooms[j].name)) continue;
+      const g = doorGeom(i, j);
+      if (g) cands.push({i, j, rect:g.rect, o:g.o});
+    }
+  }
+  // 每个房间最多 2 扇内门
+  const cap = n => base(n) === '过道' ? 99 : 2;
+  const cnt = {}, kept = [];
+  cands.forEach(c => {
+    if ((cnt[c.i]||0) >= cap(rooms[c.i].name) || (cnt[c.j]||0) >= cap(rooms[c.j].name)) return;
+    cnt[c.i] = (cnt[c.i]||0)+1; cnt[c.j] = (cnt[c.j]||0)+1;
+    kept.push(c);
+  });
+  // 连通性修复：还有房间没门 → 放宽规则强行接到一个已连通的相邻房间
+  const adj = rooms.map(()=>[]);
+  kept.forEach(c => { adj[c.i].push(c.j); adj[c.j].push(c.i); });
+  const root = Math.max(0, rooms.findIndex(r => r.name === '玄关'));
+  for (let pass = 0; pass < rooms.length; pass++){
+    const seen = new Set([root]), stack = [root];
+    while (stack.length){ const c = stack.pop(); adj[c].forEach(n => { if (!seen.has(n)){ seen.add(n); stack.push(n); } }); }
+    let fixed = false;
+    for (let i = 0; i < rooms.length && !fixed; i++){
+      if (seen.has(i)) continue;
+      let pick = null;
+      for (let j = 0; j < rooms.length; j++){
+        if (i === j || !seen.has(j)) continue;
+        const g = doorGeom(i, j);
+        if (!g) continue;
+        const bn = base(rooms[j].name);
+        if (!pick || bn === '客厅' || bn === '玄关') pick = {j, g};
+        if (bn === '客厅') break;
+      }
+      if (pick){
+        kept.push({i, j:pick.j, rect:pick.g.rect, o:pick.g.o});
+        adj[i].push(pick.j); adj[pick.j].push(i);
+        fixed = true;
+      }
+    }
+    if (!fixed) break;
+  }
+  // 落地成 doors
+  kept.forEach(c => {
+    const x0 = c.rect[0], y0 = c.rect[1], x1 = c.rect[2], y1 = c.rect[3];
+    const cx = (x0+x1)/2, cy = (y0+y1)/2;
+    doors.push({name: tr('门','Door'), rect:[x0,y0,x1,y1],
+                h: c.o[0] ? [x0, cy] : [cx, y0],
+                c: c.o[0] ? [0,1] : [1,0], o: c.o,
+                len: c.o[0] ? (y1-y0) : (x1-x0)});
+  });
+  // 入户门：玄关朝外墙开门
+  const hIdx = rooms.findIndex(r => r.name === '玄关');
+  if (hIdx >= 0){
+    const b = lay.rooms[hIdx].rect;
+    let d = null;
+    if (Math.abs(b.y1-inner.y1) < 1){ const mid = (b.x0+b.x1)/2; d = {rect:[mid-450, inner.y1, mid+450, inner.y1+T], o:[0,-1]}; }
+    else if (Math.abs(b.x0-inner.x0) < 1){ const mid = (b.y0+b.y1)/2; d = {rect:[inner.x0-T, mid-450, inner.x0, mid+450], o:[1,0]}; }
+    else if (Math.abs(b.y0-inner.y0) < 1){ const mid = (b.x0+b.x1)/2; d = {rect:[mid-450, inner.y0-T, mid+450, inner.y0], o:[0,1]}; }
+    else { const mid = (b.y0+b.y1)/2; d = {rect:[inner.x1, mid-450, inner.x1+T, mid+450], o:[-1,0]}; }
+    const cx = (d.rect[0]+d.rect[2])/2, cy = (d.rect[1]+d.rect[3])/2;
+    doors.push({name: tr('入户门','Entry door'), rect:d.rect,
+                h: d.o[0] ? [d.rect[0], cy] : [cx, d.rect[1]],
+                c: d.o[0] ? [0,1] : [1,0], o: d.o,
+                len: d.o[0] ? (d.rect[3]-d.rect[1]) : (d.rect[2]-d.rect[0]), entry: true});
+  }
+  return {rooms, walls, wins, doors, slides: []};
+}
+
+function buildGeneratedPlan(areaM2, ratio, tplKey){
+  const T = 240;
+  const items = GEN_TEMPLATES[tplKey].items;
+  const target = areaM2*1e6;
+  let W = Math.sqrt(target*ratio), H = Math.sqrt(target/ratio);
+  let inner = {x0:0, y0:0, x1:W, y1:H}, lay = null;
+  for (let i = 0; i < 16; i++){
+    lay = genSlice(inner, items, T);
+    const usable = lay.rooms.reduce((a,r)=>a + (r.rect.x1-r.rect.x0)*(r.rect.y1-r.rect.y0), 0);
+    if (!usable) break;
+    const k = Math.sqrt(target/usable);
+    if (Math.abs(k-1) < 0.0012) break;
+    inner = {x0:0, y0:0, x1:inner.x1*k, y1:inner.y1*k};
+  }
+  return assemblePlan(lay, inner, T);
+}
+
+function generatePlan(){
+  if (!confirm(tr('生成会覆盖当前户型（可用「撤销」回退），确定继续吗？',
+                  'Generating replaces the current floor plan (Undo restores it). Continue?'))) return;
+  planMutate(() => {
+    state.plan = buildGeneratedPlan(genArea, genRatio, genTpl);
+    psel = null;
+  });
+  planSeg = 'edit';
+  paletteKey = '';
+  renderPlanUI();
+  toast(tr('已生成户型，切到「① 改房间」继续微调', 'Plan generated — switch to "① Edit rooms" to fine-tune'));
+}
+
+
+/* =======================================================================
  *  模式切换与 UI
  * ==================================================================== */
+function segmentBarHtml(){
+  const t = (seg, zh, en) => `<button class="seg-tab${planSeg===seg?' on':''}" data-seg="${seg}">${tr(zh,en)}</button>`;
+  return `<div class="seg-tabs">
+    ${t('edit','① 改房间','① Edit rooms')}
+    ${t('gen','② 生成户型','② Generate plan')}
+  </div>`;
+}
 function paletteHtml(){
   const b = (mode, zh, en, tipZh, tipEn) =>
     `<div class="item${addMode===mode?' on':''}" data-add="${mode}" title="${tr(tipZh, tipEn)}">
@@ -668,28 +919,69 @@ function paletteHtml(){
   <div class="actions" style="padding:0 10px 14px">
     <button class="btn" id="pReset2">${tr('重置为默认户型','Reset to default plan')}</button></div>`;
 }
+function genPaletteHtml(){
+  const ratioBtns = GEN_RATIOS.map(([k,r,zh,en]) =>
+    `<button class="btn chip${genRatio===r?' on':''}" data-ratio="${r}" style="margin:0 4px 6px 0">${tr(zh,en)}</button>`).join('');
+  const tplBtns = Object.entries(GEN_TEMPLATES).map(([k,t]) =>
+    `<button class="btn chip${genTpl===k?' on':''}" data-tpl="${k}" style="margin:0 4px 6px 0">${tr(t.zh,t.en)}</button>`).join('');
+  return `
+  <h4>${tr('生成户型 · 选面积和形状','Generate a plan · pick area & shape')}</h4>
+  <div style="padding:4px 12px 0">
+    <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">
+      ${tr('套内使用面积','Usable floor area')} <b id="genAreaVal" style="color:var(--ink)">${genArea}</b> m²</label>
+    <input type="range" id="genArea" min="40" max="160" step="1" value="${genArea}" style="width:100%">
+    <div style="font-size:11px;color:var(--muted);margin:6px 0 2px">${tr('外形','Shape')}</div>
+    <div>${ratioBtns}</div>
+    <div style="font-size:11px;color:var(--muted);margin:6px 0 2px">${tr('户型','Layout')}</div>
+    <div>${tplBtns}</div>
+    <div class="actions" style="margin-top:10px">
+      <button class="btn primary" id="genGo">${tr('生成户型','Generate')}</button>
+    </div>
+    <div class="hint" style="padding:6px 0 14px">${tr(
+      '生成会按「功能分带 + 面积配额」把矩形切成房间，并自动配上外墙、内墙、窗与门，房间和墙天然对得上。<br>会覆盖当前户型（可用「撤销」回退），生成后再回到「① 改房间」继续微调。',
+      'The rectangle is cut into rooms by zone bands and area quotas, then walls, windows and doors are derived from the room boundaries, so rooms and walls always match.<br>This replaces the current plan (Undo restores it); switch back to "① Edit rooms" to fine-tune.')}</div>
+  </div>`;
+}
+
 
 function renderLeftPanel(){
   const lib = el('#lib');
   if (!lib) return;
   const want = planMode && !is3d();          // 3D 下左侧仍是家具库，方便在 3D 里摆家具
   if (want){
-    const key = 'palette|' + addMode;
+    const key = 'palette|' + planSeg + '|' + addMode + '|' + genRatio + '|' + genTpl;
     if (lib.dataset.mode !== 'palette' || paletteKey !== key){
       lib.dataset.mode = 'palette'; paletteKey = key;
-      lib.innerHTML = paletteHtml();
-      lib.querySelectorAll('[data-add]').forEach(it => it.onclick = () => {
-        addMode = addMode === it.dataset.add ? null : it.dataset.add;
-        psel = null;
-        renderPlanUI();
-        syncPlanHint();
-      });
-      const r2 = lib.querySelector('#pReset2'); if (r2) r2.onclick = resetPlan;
+      lib.innerHTML = segmentBarHtml() + (planSeg === 'gen' ? genPaletteHtml() : paletteHtml());
+      bindPalette();
     }
   } else if (lib.dataset.mode === 'palette'){
     delete lib.dataset.mode; paletteKey = '';
     buildLib();
   }
+}
+function bindPalette(){
+  const lib = el('#lib');
+  if (!lib) return;
+  lib.querySelectorAll('[data-seg]').forEach(b => b.onclick = () => {
+    planSeg = b.dataset.seg; addMode = null; psel = null; paletteKey = '';
+    renderPlanUI(); syncPlanHint();
+  });
+  lib.querySelectorAll('[data-add]').forEach(it => it.onclick = () => {
+    addMode = addMode === it.dataset.add ? null : it.dataset.add;
+    psel = null;
+    renderPlanUI();
+    syncPlanHint();
+  });
+  lib.querySelectorAll('[data-ratio]').forEach(b => b.onclick = () => { genRatio = Number(b.dataset.ratio); renderPlanUI(); });
+  lib.querySelectorAll('[data-tpl]').forEach(b => b.onclick = () => { genTpl = b.dataset.tpl; renderPlanUI(); });
+  const ar = lib.querySelector('#genArea');
+  if (ar) ar.oninput = () => {
+    genArea = Number(ar.value);
+    const v = lib.querySelector('#genAreaVal'); if (v) v.textContent = genArea;
+  };
+  const go = lib.querySelector('#genGo'); if (go) go.onclick = generatePlan;
+  const r2 = lib.querySelector('#pReset2'); if (r2) r2.onclick = resetPlan;
 }
 
 function renderPlanUI(){
@@ -710,7 +1002,9 @@ function syncPlanHint(){
   const h = el('#modehint');
   if (!h) return;
   let txt = '';
-  if (addMode === 'room') txt = tr('拖出一个矩形新建房间 · Esc 取消','Drag a rectangle to create a room · Esc cancels');
+  if (planSeg === 'gen') txt = tr('在左侧选择面积、形状和户型模板，点「生成户型」即可得到一整套户型 · P 退出户型编辑',
+    'Choose area, shape and layout on the left, then press Generate · P exits');
+  else if (addMode === 'room') txt = tr('拖出一个矩形新建房间 · Esc 取消','Drag a rectangle to create a room · Esc cancels');
   else if (addMode === 'wall') txt = tr('拖出一条线新建墙体（自动对齐水平 / 垂直，Shift 反向）· Esc 取消','Drag to create a wall (auto axis-aligned, Shift reverses) · Esc cancels');
   else if (addMode === 'win') txt = tr('点击一段墙体开窗 · Esc 取消','Click a wall to add a window · Esc cancels');
   else if (addMode === 'door') txt = tr('点击一段墙体开门 · Esc 取消','Click a wall to add a door · Esc cancels');
@@ -736,6 +1030,17 @@ function setPlanMode(on){
  * ==================================================================== */
 let _setTool = null;
 function install(){
+  // 注入户型编辑器专用样式（分段切换条）
+  if (!el('#planEditorStyle')){
+    const st = document.createElement('style');
+    st.id = 'planEditorStyle';
+    st.textContent = `.seg-tabs{display:flex;gap:4px;padding:10px 10px 2px}
+      .seg-tab{flex:1;border:1px solid var(--line);background:#fff;border-radius:8px;padding:7px 4px;
+        cursor:pointer;font-size:12px;color:var(--muted);white-space:nowrap}
+      .seg-tab:hover{background:#f2ece2}
+      .seg-tab.on{background:var(--accent);border-color:var(--accent);color:#fff}`;
+    document.head.appendChild(st);
+  }
   // 顶栏加一个「户型」按钮
   const tools = el('#tools');
   if (tools && !el('#tgPlan')){
